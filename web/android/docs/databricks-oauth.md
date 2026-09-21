@@ -1,9 +1,9 @@
 # Databricks OAuth on Android
 
 The Android app uses a public-client Databricks OAuth flow for workspace-hosted
-Omnigent. The protocol core is intentionally separate from WebView activation so
-the browser, credential, and session-bootstrap layers can be reviewed before a
-workspace stops using its existing inline login.
+Omnigent. The protocol, browser callback, and credential layers are intentionally separate
+from WebView activation so they can be reviewed before a workspace stops using
+its existing inline login.
 
 Databricks Apps are a different server type and retain inline platform SSO.
 Generic Omnigent servers retain the existing ticket/poll OIDC flow.
@@ -32,11 +32,32 @@ accepted by Gradle so ordinary builds continue to work, but native workspace
 sign-in rejects it when configuration is loaded.
 
 The redirect must use HTTPS on the default port, contain a nonempty path, and
-have no credentials, query, or fragment. Android App Link activation also
-requires the callback host to publish an `assetlinks.json` statement for the
-shipped application ID and signing certificate, and the exact redirect must be
+have no credentials, query, or fragment. Gradle projects its scheme, host, and
+path into the exported, `autoVerify` callback activity's exact App Link filter.
+The callback host must publish an `assetlinks.json` statement for the shipped
+application ID and signing certificate, and the exact redirect must be
 registered on the Databricks OAuth client. Repository configuration alone
 cannot provision either external dependency.
+
+## Browser handoff and callback
+
+Android opens the authorization URL with an `ACTION_VIEW` browsable intent so
+normal system-browser SSO and password-manager/passkey support remain available.
+The app does not place tokens, authorization codes, or PKCE material in an
+Android intent of its own.
+
+Unlike iOS's authentication session, Android may destroy Omnigent while the
+browser is in front. Before opening the browser, the app encrypts the short-lived
+attempt—workspace scope, client configuration, state, verifier, and creation
+time—with an app-owned Android Keystore key. The HTTPS callback activity restores
+that attempt after process recreation, validates the callback, consumes the
+record once, exchanges the code, and saves the resulting grant. Attempts expire
+after ten minutes. Cancellation deletes the pending record, and wrong-state or
+stale callbacks do not consume a newer attempt.
+
+The callback activity returns only a success/error signal to `MainActivity`.
+Credentials never travel through intent extras. Workspace routing does not invoke
+this handoff until the session-bootstrap layer is activated.
 
 ## Protocol boundaries
 
@@ -67,9 +88,9 @@ issuer metadata is retained so account-issued grants refresh against the same
 verified authority.
 
 OAuth requests use a native `HttpURLConnection` transport with redirects and
-caching disabled. They do not use Android WebView's cookie APIs. Callers must
-run network operations off the main thread and must never log or send tokens to
-JavaScript.
+caching disabled. They do not use Android WebView's cookie APIs. The callback
+activity and token coordinator run them off the main thread. Tokens must never
+be logged or sent to JavaScript.
 
 ## Workspace identity
 
@@ -79,5 +100,29 @@ create a second scope. Different `o` values on a shared host remain separate.
 Databricks Apps, unrelated domains, duplicate `o` values, non-decimal IDs, and
 lookalike hosts are rejected.
 
-This file will be expanded by the credential, WebView-profile, recovery, and
-sign-out layers as they are activated.
+## Credentials and refresh
+
+Versioned token records are AES-GCM encrypted in app-private preferences. The
+non-exportable AES key lives in Android Keystore and is marked usable only while
+the device is unlocked. Ciphertext is bound to its logical scope through GCM
+associated data, preferences keys are scope hashes, and Android backup remains
+disabled in the manifest. There is no plaintext preferences or file fallback.
+
+A process-wide token manager coordinates each scope:
+
+- grants with more than 60 seconds remaining are reused;
+- callers share one refresh operation per scope;
+- cancelling one caller does not cancel an issued rotation;
+- a replacement refresh token is persisted before success is returned;
+- only HTTP 400 `invalid_grant` clears the scope;
+- transient/network/malformed responses retain the prior record;
+- clear or replacement fences late refresh results;
+- a failed rotated-token write is retained in memory and retried before the old,
+  consumed refresh token can be loaded again.
+
+As on iOS, an app process loss between remote refresh rotation and local durable
+write can still require a fresh sign-in because those operations cannot be
+atomic.
+
+This file will be expanded by the WebView-profile, recovery, and sign-out layers
+as they are activated.

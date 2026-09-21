@@ -43,6 +43,20 @@
         </activity>
 
         <activity
+            android:name=".OAuthCallbackActivity"
+            android:exported="true">
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="${databricksOAuthRedirectScheme}"
+                    android:host="${databricksOAuthRedirectHost}"
+                    android:path="${databricksOAuthRedirectPath}" />
+            </intent-filter>
+        </activity>
+
+        <activity
             android:name=".ConnectActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
