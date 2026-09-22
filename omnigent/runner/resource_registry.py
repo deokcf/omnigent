@@ -1542,6 +1542,16 @@ class SessionResourceRegistry:
                 if current is not None and instance is not None and current is not instance:
                     superseded_by = current
 
+        # Persist a bounded, redacted excerpt of the final screen on the exit
+        # event itself. The pane-dead path (keep_alive_after_exit) captures it,
+        # but the exit publisher drops last_output for auxiliary terminals such
+        # as Codex, so the debug log is the only durable path to that evidence.
+        from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+
+        redacted_last_output = (
+            sanitize_diagnostic_text(last_output) if last_output else None
+        ) or None
+
         publisher = self._terminal_exit_publisher
         _logger.info(
             "Terminal exit observed: session=%s terminal=%s:%s "
@@ -1562,6 +1572,7 @@ class SessionResourceRegistry:
                 terminal_lifecycle=lifecycle.value,
                 session_status_before_exit=session_status_before_exit or "unknown",
                 terminal_exit_status=exit_status,
+                terminal_last_output=redacted_last_output,
                 superseded=superseded_by is not None,
             ),
         )
