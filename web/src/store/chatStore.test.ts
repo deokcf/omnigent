@@ -35,6 +35,12 @@ import { buildBubbles } from "@/lib/renderItems";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import {
+  clearSessionDrafts,
+  getSessionDraft,
+  promoteSessionDraft,
+  setSessionDraft,
+} from "@/lib/sessionDrafts";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
 import {
@@ -3309,6 +3315,131 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(post).toBeDefined();
     const body = JSON.parse((post![1] as RequestInit).body as string);
     expect(body.data.stable_id).not.toBe("retry_visible");
+  });
+});
+
+describe("chatStore — cancel first message during session creation", () => {
+  beforeEach(clearSessionDrafts);
+  afterEach(clearSessionDrafts);
+
+  it("cancels locally and restores the original text and raw attachments immediately", () => {
+    const file = new File(["unfinished instructions"], "instructions.txt", { type: "text/plain" });
+    const { tempConvId } = beginLocalConversation("this prompt needs correcting", [file])!;
+
+    useChatStore.getState().stop();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(useChatStore.getState()).toMatchObject({
+      conversationId: tempConvId,
+      status: "idle",
+      pendingUserMessages: [],
+      failedSendDraft: {
+        conversationId: tempConvId,
+        text: "this prompt needs correcting",
+        files: [file],
+      },
+    });
+    expect(useChatStore.getState().failedSendDraft?.files[0]).toBe(file);
+    expect(getSessionDraft(tempConvId)).toEqual({
+      text: "this prompt needs correcting",
+      files: [file],
+    });
+    expect(getSessionDraft(tempConvId)?.files[0]).toBe(file);
+  });
+
+  it.each([
+    { label: "plain message", text: "do not send this", skill: null },
+    {
+      label: "slash command",
+      text: "/review unfinished",
+      skill: { name: "review", args: "unfinished" },
+    },
+  ])("binds the real session without dispatching the canceled $label", async ({ text, skill }) => {
+    seedSession("conv_cancelled");
+    const file = new File(["attachment"], "notes.txt", { type: "text/plain" });
+    const { tempConvId, pendingMsgTempId } = beginLocalConversation(text, [file])!;
+    const navigate = vi.fn();
+    useChatStore.getState().stop();
+
+    // NewChatDialog promotes the draft before handing off the created session.
+    promoteSessionDraft(tempConvId, "conv_cancelled");
+    hydrateLocalConversation(
+      tempConvId,
+      "conv_cancelled",
+      "agent_xyz",
+      text,
+      [file],
+      pendingMsgTempId,
+      skill,
+      navigate,
+    );
+    await tick();
+    await tick();
+
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toEqual([]);
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url) === "/v1/sessions/conv_cancelled/stream"),
+    ).toHaveLength(1);
+    expect(navigate).toHaveBeenCalledWith("/c/conv_cancelled", { replace: true });
+    expect(useChatStore.getState()).toMatchObject({
+      conversationId: "conv_cancelled",
+      status: "idle",
+      loadingConversation: false,
+      pendingUserMessages: [],
+      failedSendDraft: { conversationId: "conv_cancelled", text, files: [file] },
+    });
+    expect(useChatStore.getState().abortController?.signal.aborted).toBe(false);
+    expect(getSessionDraft(tempConvId)).toBeUndefined();
+    expect(getSessionDraft("conv_cancelled")).toEqual({ text, files: [file] });
+  });
+
+  it("preserves a newer draft and does not navigate away from another conversation", async () => {
+    seedSession("conv_cancelled");
+    seedSession("conv_other");
+    const { tempConvId, pendingMsgTempId } = beginLocalConversation(
+      "cancel this initial prompt",
+      undefined,
+    )!;
+    const newerFile = new File(["correction"], "correction.txt", { type: "text/plain" });
+    const newerDraft = { text: "use these corrected instructions", files: [newerFile] };
+    setSessionDraft(tempConvId, newerDraft);
+
+    useChatStore.getState().stop();
+    expect(getSessionDraft(tempConvId)).toEqual(newerDraft);
+    await useChatStore.getState().switchTo("conv_other");
+    const otherDraft = { text: "unrelated work", files: [] };
+    setSessionDraft("conv_other", otherDraft);
+    const navigate = vi.fn();
+
+    promoteSessionDraft(tempConvId, "conv_cancelled");
+    hydrateLocalConversation(
+      tempConvId,
+      "conv_cancelled",
+      "agent_xyz",
+      "cancel this initial prompt",
+      undefined,
+      pendingMsgTempId,
+      null,
+      navigate,
+    );
+    await tick();
+    await tick();
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(useChatStore.getState()).toMatchObject({
+      conversationId: "conv_other",
+      status: "idle",
+      pendingUserMessages: [],
+      failedSendDraft: null,
+    });
+    expect(getSessionDraft("conv_other")).toEqual(otherDraft);
+    expect(getSessionDraft("conv_cancelled")).toEqual(newerDraft);
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toEqual([]);
+    expect(conversationRegistry.peek("conv_cancelled")?.getState()).toMatchObject({
+      status: "idle",
+      pendingUserMessages: [],
+      failedSendDraft: { conversationId: "conv_cancelled" },
+    });
   });
 });
 

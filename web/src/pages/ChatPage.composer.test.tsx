@@ -374,6 +374,54 @@ describe("Composer session drafts", () => {
   });
 });
 
+describe("Composer starting-session cancellation", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    setComposerState({
+      conversationId: "temp:cancel_initial",
+      blocks: [],
+      failedSendDraft: null,
+      queuedMessages: [],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+  });
+
+  it.each(["button", "Escape"])(
+    "keeps Interrupt available with a typed draft and cancels using %s",
+    (trigger) => {
+      const props = composerProps({
+        status: "streaming",
+        isWorking: true,
+        disabled: true,
+        unreachable: true,
+        permissionLevel: 1,
+        sendDisabledReason: "Starting the session…",
+      });
+      render(<Composer {...props} />);
+
+      fireEvent.change(textarea(), { target: { value: "a correction while choosing a model" } });
+      expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(props.onStop).not.toHaveBeenCalled();
+
+      if (trigger === "button") {
+        fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+      } else {
+        fireEvent.keyDown(textarea(), { key: "Escape" });
+      }
+
+      expect(props.onStop).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("a correction while choosing a model");
+    },
+  );
+});
+
 describe("Composer growth layout", () => {
   afterEach(() => {
     cleanup();

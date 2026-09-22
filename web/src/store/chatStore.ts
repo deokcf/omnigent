@@ -108,6 +108,7 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
 // Re-exported below so existing `@/store/chatStore` importers keep working; the
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
@@ -341,6 +342,7 @@ export function beginLocalConversation(
   const bubble: PendingUserMessage = {
     tempId: pendingMsgTempId,
     content,
+    initialDraft: { text, files: files ?? [] },
     createdAtS: Math.floor(Date.now() / 1000),
     ...(selfAuthor !== null ? { author: selfAuthor } : {}),
   };
@@ -384,6 +386,16 @@ export function beginLocalConversation(
   return { tempConvId, pendingMsgTempId, createToken };
 }
 
+/** Whether a temporary conversation still owns its unsent first message. */
+export function hasPendingLocalMessage(tempConvId: string): boolean {
+  return (
+    conversationRegistry
+      .peek(tempConvId)
+      ?.getState()
+      .pendingUserMessages.some((message) => message.initialDraft !== undefined) ?? false
+  );
+}
+
 /**
  * Hydrate a client-only conversation onto its real server id once
  * `createSession` returns: rekey the registry entry (carrying the optimistic
@@ -407,6 +419,8 @@ export function hydrateLocalConversation(
   isStillViewing: () => boolean = () => true,
   project?: LocalConversationProject,
 ): void {
+  const shouldSend = hasPendingLocalMessage(tempConvId);
+  const restoredDraft = conversationRegistry.peek(tempConvId)?.getState().failedSendDraft;
   // Registry entry (carrying the optimistic bubble) + the sidebar row, both
   // id-addressed. Rekey the row BEFORE the caller's refetch so a lagging index
   // can't drop it. No send-chain migration: the composer is read-only for a temp
@@ -414,6 +428,9 @@ export function hydrateLocalConversation(
   // the chain under the real id directly.
   conversationRegistry.rekey(tempConvId, realId);
   rekeyConvRow(tempConvId, realId, text, project);
+  if (restoredDraft) {
+    setterFor(realId)({ failedSendDraft: { ...restoredDraft, conversationId: realId } });
+  }
 
   const stillViewing = useChatStore.getState().conversationId === tempConvId && isStillViewing();
   if (stillViewing) {
@@ -421,6 +438,14 @@ export function hydrateLocalConversation(
     conversationRegistry.setActive(realId);
     mirrorActiveEntry();
     navigate(`/c/${realId}`, { replace: true });
+  }
+
+  if (!shouldSend) {
+    // Creation can finish after Interrupt; bind the empty session without sending.
+    void ensureBoundSession(agentId, useChatStore.getState, undefined, realId).catch(() => {
+      // bindStream records load failures on the conversation.
+    });
+    return;
   }
 
   const store = useChatStore.getState();
@@ -483,6 +508,8 @@ export function removeLocalConversation(tempConvId: string): boolean {
 export interface PendingUserMessage {
   tempId: string;
   content: MessageContentBlock[];
+  /** Unsent first-message draft, including files not uploaded yet. */
+  initialDraft?: { text: string; files: File[] };
   /** Client epoch seconds stamped ONCE at send time — the optimistic
    *  bubble's display timestamp. Stamping here (not at render or
    *  promotion) keeps the shown time pinned to when the user hit send.
@@ -2438,6 +2465,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   stop: () => {
     const sessionId = get().conversationId;
     if (!sessionId) return;
+    if (isTempConvId(sessionId)) {
+      const initialDraft = get().pendingUserMessages[0]?.initialDraft;
+      if (!initialDraft) return;
+      const draft = getSessionDraft(sessionId) ?? initialDraft;
+      setSessionDraft(sessionId, draft);
+      setActive({
+        pendingUserMessages: [],
+        status: "idle",
+        failedSendDraft: { ...draft, conversationId: sessionId },
+      });
+      return;
+    }
     // Fire-and-forget interrupt; the server emits session.interrupted
     // + response.incomplete on the open stream, which the pump
     // translates into the cancelled bubble decoration. We deliberately

@@ -732,7 +732,8 @@ export function ChatPage() {
 
   // Keep the parent's Stop action live while its turn waits on an elicitation.
   // Child activity and display suppression belong to `showsWorking` below.
-  const isWorking = computeIsWorking(sessionStatus);
+  const isWorking =
+    computeIsWorking(sessionStatus) || (isTempConvId(urlConvId) && status === "streaming");
   // Managed-sandbox stages own the in-progress slot with specific pipeline
   // copy. A normal terminal runner launch keeps the standard Working shimmer
   // so startup does not introduce a second, special chat state.
@@ -2925,7 +2926,8 @@ function ComposerImpl(
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
   const hasDraft = fullText.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
-  const showInterruptButton = isWorking && (!hasDraft || hasPendingElicitation);
+  const showInterruptButton =
+    isWorking && (!hasDraft || hasPendingElicitation || isTempConvId(conversationId));
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // the local mention chips, deduping against what's already tagged, then
