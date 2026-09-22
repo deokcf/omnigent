@@ -96,6 +96,20 @@ exception class, session ID, and PID. If no reporting thread can start, the
 exception class remains available as `stderr_capture_error_type` in the startup
 failure snapshot; warning delivery is best effort.
 
+## Codex terminal launch and exit
+
+Every runner-owned Codex TUI launch logs one `codex_terminal_launch` event with
+the launched `command`, the probed `codex_cli_version`, whether the launch is a
+`resume`, and the resolved `args` after the host's `harness.codex-native.args`
+are merged. Values are redacted before logging: `NAME=value` environment
+assignments and every `-c` override outside the permission and model keys are
+masked, and URLs lose their userinfo and query string.
+
+The TUI's private tmux server keeps its pane after the process exits
+(`keep_alive_after_exit`), so the `terminal_exit_observed` event carries the
+inner exit status and the final screen instead of a bare "no server running"
+probe failure.
+
 ## Codex startup failure snapshot
 
 When a fresh native Codex session times out waiting for its first thread, or
