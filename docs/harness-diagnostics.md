@@ -108,12 +108,15 @@ masked, and URLs lose their userinfo and query string.
 The TUI's private tmux server keeps its pane after the process exits
 (`keep_alive_after_exit`), so once the terminal has started, its exit is
 captured by the watcher's pane-dead path instead of collapsing into a bare "no
-server running" probe failure. The `terminal_exit_observed` event then records
-the inner exit status (`terminal_exit_status`) and a bounded, redacted excerpt
-of the pane's final screen (`terminal_last_output`, stripped of terminal
-control sequences and known credential patterns). For a required terminal the
-same `last_output` also reaches the terminal failure display; auxiliary
-terminals such as Codex rely on the event's excerpt.
+server running" probe failure. The Codex terminal's `terminal_exit_observed`
+event then records the inner exit status (`terminal_exit_status`) and a bounded,
+redacted excerpt of the pane's final screen (`terminal_last_output`, stripped of
+terminal control sequences and known credential patterns). This excerpt is
+scoped to the Codex terminal — other terminals keep the guarantee that
+lifecycle-event attributes carry no pane contents (see
+`terminal-lifecycle-diagnostics.md`). Codex's exit is auxiliary, so its
+`last_output` never reaches the terminal failure display (that path is
+required-terminal only); the event excerpt is its durable record.
 
 An exit that happens before the terminal is registered (e.g. the app-server
 dies during startup) still takes the launch-failure path and does not produce

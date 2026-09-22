@@ -774,6 +774,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert launch_events[0].attributes["command"] == "codex-wrapper"
     assert launch_events[0].attributes["resume"] is True
     assert launch_events[0].attributes["args"] == shlex.join(launched.args)
+    from omnigent.harnesses.codex_native.app_server import _format_codex_version
+
+    assert launch_events[0].attributes["codex_cli_version"] == _format_codex_version(version)
     assert preload_calls == [
         (
             app_server.listen_url,

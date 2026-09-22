@@ -385,9 +385,10 @@ async def test_auxiliary_terminal_exit_publishes_resource_exit_only(
     assert record.attributes["terminal_instance_id"] == instance.diagnostic_id
     assert record.attributes["session_status_before_exit"] == "unknown"
     assert record.attributes["superseded"] is False
-    # The event carries a redacted excerpt of the final screen (escape
-    # sequences stripped); the cwd is still never exposed in attributes.
-    assert record.attributes["terminal_last_output"] == "startup failed\nretry login"
+    # A non-Codex terminal keeps the guarantee: no pane contents, no cwd in
+    # the lifecycle-event attributes.
+    assert record.attributes["terminal_last_output"] is None
+    assert "startup failed" not in str(record.attributes)
     assert str(tmp_path) not in str(record.attributes)
 
 
@@ -433,7 +434,9 @@ async def test_auxiliary_codex_exit_persists_redacted_final_screen(
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
     registry.set_terminal_exit_publisher(_publish_exit)
 
-    await registry.observe_auxiliary_terminal("conv_codex", "codex", "main", instance)
+    await registry.observe_auxiliary_terminal(
+        "conv_codex", "codex", "main", instance, resource_role=CODEX_NATIVE_TERMINAL_ROLE
+    )
     on_exit = callbacks["on_exit"]
     assert callable(on_exit)
     on_exit()

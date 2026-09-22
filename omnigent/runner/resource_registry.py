@@ -1503,7 +1503,7 @@ class SessionResourceRegistry:
         terminal_id = terminal_resource_id(terminal_name, session_key)
         with self._lock:
             observed = self._terminal_lifecycles.pop((session_id, terminal_id), None)
-            self._terminal_roles.pop((session_id, terminal_id), None)
+            observed_role = self._terminal_roles.pop((session_id, terminal_id), None)
         if observed is None:
             return
         if observed != lifecycle:
@@ -1542,15 +1542,17 @@ class SessionResourceRegistry:
                 if current is not None and instance is not None and current is not instance:
                     superseded_by = current
 
-        # Persist a bounded, redacted excerpt of the final screen on the exit
-        # event itself. The pane-dead path (keep_alive_after_exit) captures it,
-        # but the exit publisher drops last_output for auxiliary terminals such
-        # as Codex, so the debug log is the only durable path to that evidence.
-        from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+        # Only the Codex terminal records a final-screen excerpt on its exit
+        # event. Codex takes the pane-dead path (keep_alive_after_exit) but its
+        # last_output is dropped by the publisher's auxiliary short-circuit, so
+        # the debug log is the only durable path to that evidence. Every other
+        # terminal keeps the guarantee that lifecycle attributes hold no pane
+        # contents, so their excerpt stays absent.
+        redacted_last_output: str | None = None
+        if observed_role == CODEX_NATIVE_TERMINAL_ROLE and last_output:
+            from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 
-        redacted_last_output = (
-            sanitize_diagnostic_text(last_output) if last_output else None
-        ) or None
+            redacted_last_output = sanitize_diagnostic_text(last_output) or None
 
         publisher = self._terminal_exit_publisher
         _logger.info(
