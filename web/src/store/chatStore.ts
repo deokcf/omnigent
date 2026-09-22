@@ -1302,6 +1302,55 @@ let queueSeq = 0;
 // never reordering a slow one.
 const SEND_CHAIN_MAX_WAIT_MS = 180_000;
 
+function initialNativeModelPending(state: ConversationState): boolean {
+  // Claude reports its model before a prompt; other native CLIs may need a turn.
+  return state.sessionModelSeeded && state.sessionHarness === "claude-native";
+}
+
+/** Keep the first draft local while the native model picker is still starting. */
+function waitForInitialModel(conversationId: string, tempId: string): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const finish = (ready: boolean, error?: Error) => {
+      clearTimeout(timer);
+      unsubscribe();
+      unsubscribeDisposed();
+      if (error) reject(error);
+      else resolve(ready);
+    };
+    const check = () => {
+      const entry = conversationRegistry.peek(conversationId);
+      const state = entry?.getState();
+      if (
+        !state ||
+        entry?.disposed ||
+        !state.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft)
+      ) {
+        finish(false);
+      } else if (state.conversationLoadError || state.sessionStatus === "failed") {
+        finish(
+          false,
+          state.conversationLoadError ??
+            new Error("Session failed before the first message was sent."),
+        );
+      } else if (!initialNativeModelPending(state)) {
+        finish(true);
+      }
+    };
+    const unsubscribe = conversationRegistry.subscribe((id) => {
+      if (id === conversationId) check();
+    });
+    const unsubscribeDisposed = conversationRegistry.subscribeDisposed((id) => {
+      if (id === conversationId) finish(false);
+    });
+    const timer = setTimeout(
+      () =>
+        finish(false, new Error("The model did not finish starting. Please retry the message.")),
+      SEND_CHAIN_MAX_WAIT_MS,
+    );
+    check();
+  });
+}
+
 /**
  * Read one conversation's server-side status from the sidebar cache.
  *
@@ -2071,6 +2120,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (opensSideChat) {
       useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
     }
+    const targetState = pinnedId === null ? get() : setterForState(pinnedId);
+    const initialDraft =
+      opts?.reusePendingTempId != null
+        ? targetState?.pendingUserMessages.find((p) => p.tempId === opts.reusePendingTempId)
+            ?.initialDraft
+        : !opensSideChat &&
+            targetState?.sessionModelSeeded &&
+            (targetState.sessionHarness === null || targetState.sessionHarness === "claude-native")
+          ? { text, files: files ?? [] }
+          : undefined;
     const alreadyStreaming =
       opts?.reusePendingTempId != null
         ? false
@@ -2126,6 +2185,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               {
                 tempId,
                 content,
+                ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
               },
@@ -2157,14 +2217,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
+    let initialDispatched = false;
+    const initialSendPending = () => {
+      const id = postedSessionId ?? submitConversationId;
+      const state = id === null ? get() : setterForState(id);
+      return state?.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft);
+    };
 
     try {
       await waitForPrior();
+      if (initialDraft && !initialSendPending()) return;
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
+      if (initialDraft && !(await waitForInitialModel(sessionId, tempId))) return;
 
       // Upload any attached files and build the real content blocks with
       // server-assigned file_ids (input_image for images, input_file
@@ -2176,6 +2244,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...fileBlocks,
         ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
       ];
+      if (initialDraft && !initialSendPending()) return;
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's
       // session.input.consumed is text-only (transcript round-trip
@@ -2194,6 +2263,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
       }
 
+      if (initialDraft) {
+        // From this point Interrupt belongs to the runner, not the local draft.
+        setterFor(sessionId)((s) => ({
+          pendingUserMessages: s.pendingUserMessages.map((p) =>
+            p.tempId === tempId ? { ...p, initialDraft: undefined } : p,
+          ),
+          status: "streaming",
+          sendLatchedAt: Date.now(),
+        }));
+        initialDispatched = true;
+      }
       const postResult = await postEvent(sessionId, {
         type: "message",
         data: {
@@ -2248,6 +2328,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // status transitions that happen during the turn.
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
+      if (initialDraft && !initialDispatched && !initialSendPending()) return;
       const { message, code } = describeSendFailure(err);
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm
@@ -2465,18 +2546,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   stop: () => {
     const sessionId = get().conversationId;
     if (!sessionId) return;
-    if (isTempConvId(sessionId)) {
-      const initialDraft = get().pendingUserMessages[0]?.initialDraft;
-      if (!initialDraft) return;
+    const initialDraft = get().pendingUserMessages.find((p) => p.initialDraft)?.initialDraft;
+    if (initialDraft) {
       const draft = getSessionDraft(sessionId) ?? initialDraft;
       setSessionDraft(sessionId, draft);
       setActive({
         pendingUserMessages: [],
         status: "idle",
+        sendLatchedAt: null,
         failedSendDraft: { ...draft, conversationId: sessionId },
       });
       return;
     }
+    if (isTempConvId(sessionId)) return;
     // Fire-and-forget interrupt; the server emits session.interrupted
     // + response.incomplete on the open stream, which the pump
     // translates into the cancelled bubble decoration. We deliberately

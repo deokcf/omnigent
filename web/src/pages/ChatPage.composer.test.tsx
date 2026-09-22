@@ -381,6 +381,7 @@ describe("Composer starting-session cancellation", () => {
       conversationId: "temp:cancel_initial",
       blocks: [],
       failedSendDraft: null,
+      pendingUserMessages: [],
       queuedMessages: [],
     });
   });
@@ -388,6 +389,7 @@ describe("Composer starting-session cancellation", () => {
   afterEach(() => {
     cleanup();
     clearSessionDrafts();
+    setComposerState({ pendingUserMessages: [] });
   });
 
   it.each(["button", "Escape"])(
@@ -418,6 +420,37 @@ describe("Composer starting-session cancellation", () => {
       expect(props.onStop).toHaveBeenCalledOnce();
       expect(props.onSend).not.toHaveBeenCalled();
       expect(textarea()).toHaveValue("a correction while choosing a model");
+    },
+  );
+
+  it.each(["button", "Escape"])(
+    "keeps Interrupt available after real-ID promotion with a typed draft using %s",
+    (trigger) => {
+      setComposerState({
+        conversationId: "conv_initial_model_pending",
+        sessionStatus: "idle",
+        pendingUserMessages: [
+          {
+            tempId: "pend_initial",
+            content: [{ type: "input_text", text: "original task" }],
+            initialDraft: { text: "original task", files: [] },
+          },
+        ],
+      });
+      const props = composerProps({ status: "idle", isWorking: true });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "corrected task" } });
+      expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+
+      if (trigger === "button") {
+        fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+      } else {
+        fireEvent.keyDown(textarea(), { key: "Escape" });
+      }
+
+      expect(props.onStop).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("corrected task");
     },
   );
 });

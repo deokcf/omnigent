@@ -3443,6 +3443,298 @@ describe("chatStore — cancel first message during session creation", () => {
   });
 });
 
+describe("chatStore — first message during native model startup", () => {
+  const sessionId = "conv_native_startup";
+  const original = "unfinished first prompt";
+  let harness = "claude-native";
+
+  beforeEach(() => {
+    harness = "claude-native";
+    clearSessionDrafts();
+    seedSession(sessionId);
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).split("?")[0] === `/v1/sessions/${sessionId}`) {
+        return mockResponse({
+          id: sessionId,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          harness,
+          labels: {
+            "omnigent.wrapper":
+              harness === "claude-native" ? "claude-code-native-ui" : "codex-native-ui",
+          },
+          llm_model: null,
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+  });
+  afterEach(clearSessionDrafts);
+
+  function begin(files?: File[]): void {
+    const { tempConvId, pendingMsgTempId } = beginLocalConversation(
+      original,
+      files,
+      undefined,
+      undefined,
+      { modelOverride: harness === "claude-native" ? "haiku" : "gpt-5.6", harness },
+    )!;
+    hydrateLocalConversation(
+      tempConvId,
+      sessionId,
+      "agent_xyz",
+      original,
+      files,
+      pendingMsgTempId,
+      null,
+      () => {},
+    );
+  }
+
+  function reportModel(): void {
+    handleSessionEvent(
+      { type: "session_model", conversationId: sessionId, model: "haiku" },
+      sessionId,
+    );
+  }
+
+  function eventBodies(): { type: string; data: Record<string, unknown> }[] {
+    return fetchMock.mock.calls
+      .filter(([url, init]) => String(url).endsWith("/events") && init?.method === "POST")
+      .map(([, init]) => JSON.parse(init.body as string));
+  }
+
+  async function settle(): Promise<void> {
+    await tick();
+    await tick();
+  }
+
+  it("keeps the first draft local until the model reports, then hands Interrupt to the runner", async () => {
+    begin();
+    await settle();
+    expect(useChatStore.getState()).toMatchObject({
+      conversationId: sessionId,
+      sessionModelSeeded: true,
+      pendingUserMessages: [{ initialDraft: { text: original, files: [] } }],
+    });
+    expect(eventBodies()).toEqual([]);
+
+    handleSessionEvent({ type: "session_status", conversationId: sessionId, status: "idle" });
+    expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeDefined();
+    reportModel();
+    await settle();
+
+    expect(eventBodies()).toEqual([
+      {
+        type: "message",
+        data: expect.objectContaining({ content: [{ type: "input_text", text: original }] }),
+      },
+    ]);
+    expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeUndefined();
+    expect(useChatStore.getState().status).toBe("streaming");
+    useChatStore.getState().stop();
+    await settle();
+    expect(eventBodies().at(-1)?.type).toBe("interrupt");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("cancels and restores repeated corrected drafts before native startup finishes", async () => {
+    begin();
+    await settle();
+    const cancelAndExpectDraft = (text: string) => {
+      useChatStore.getState().stop();
+      expect(useChatStore.getState().failedSendDraft).toMatchObject({
+        conversationId: sessionId,
+        text,
+        files: [],
+      });
+      expect(eventBodies()).toEqual([]);
+    };
+    const correctAndCancel = async (text: string) => {
+      setSessionDraft(sessionId, { text: "", files: [] });
+      useChatStore.setState({ failedSendDraft: null });
+      const sending = useChatStore.getState().send(text, "agent_xyz");
+      await settle();
+      cancelAndExpectDraft(text);
+      await sending;
+    };
+    cancelAndExpectDraft(original);
+    await correctAndCancel("first correction");
+    await correctAndCancel("second correction");
+
+    const corrected = useChatStore.getState().send("final correction", "agent_xyz");
+    reportModel();
+    await corrected;
+    expect(eventBodies()).toEqual([
+      {
+        type: "message",
+        data: expect.objectContaining({
+          content: [{ type: "input_text", text: "final correction" }],
+        }),
+      },
+    ]);
+  });
+
+  it("does not wait for Codex's first-turn model report or own its subsequent sends locally", async () => {
+    harness = "codex-native";
+    begin();
+    await settle();
+
+    expect(eventBodies()).toHaveLength(1);
+    expect(useChatStore.getState().sessionModelSeeded).toBe(true);
+    expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeUndefined();
+    useChatStore.getState().stop();
+    await settle();
+    expect(eventBodies().at(-1)?.type).toBe("interrupt");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+
+    const following = useChatStore.getState().send("a later Codex message", "agent_xyz");
+    expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeUndefined();
+    await following;
+    expect(eventBodies().at(-1)?.type).toBe("message");
+  });
+
+  it("waits on the background conversation's model rather than the visible conversation", async () => {
+    begin();
+    await settle();
+    seedSession("conv_other");
+    await useChatStore.getState().switchTo("conv_other");
+    reportModel();
+    await settle();
+
+    expect(eventBodies()).toHaveLength(1);
+    expect(useChatStore.getState()).toMatchObject({
+      conversationId: "conv_other",
+      pendingUserMessages: [],
+      status: "idle",
+      failedSendDraft: null,
+    });
+    expect(conversationRegistry.peek(sessionId)?.getState().pendingUserMessages[0]?.posted).toBe(
+      true,
+    );
+  });
+
+  it.each([false, true])(
+    "does not dispatch or restore a canceled draft when binding settles (failed=%s)",
+    async (failed) => {
+      const baseFetch = fetchMock.getMockImplementation()!;
+      let releaseBind!: () => void;
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).split("?")[0] === `/v1/sessions/${sessionId}`) {
+          return new Promise<Response>((resolve) => {
+            releaseBind = () =>
+              resolve(
+                failed ? mockResponse({}, { ok: false, status: 500 }) : baseFetch(input, init),
+              );
+          });
+        }
+        return baseFetch(input, init);
+      });
+      begin();
+      await settle();
+      useChatStore.getState().stop();
+      setSessionDraft(sessionId, { text: "newer correction", files: [] });
+      useChatStore.setState({ failedSendDraft: null });
+      releaseBind();
+      await settle();
+
+      expect(eventBodies()).toEqual([]);
+      expect(getSessionDraft(sessionId)?.text).toBe("newer correction");
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+      expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toEqual([]);
+    },
+  );
+
+  it.each([false, true])(
+    "never posts an initial message canceled during upload (failed=%s)",
+    async (failed) => {
+      const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+      const baseFetch = fetchMock.getMockImplementation()!;
+      let releaseUpload!: () => void;
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).endsWith("/resources/files")) {
+          return new Promise<Response>((resolve) => {
+            releaseUpload = () =>
+              resolve(
+                failed
+                  ? mockResponse({}, { ok: false, status: 500 })
+                  : mockResponse({ id: "file_uploaded" }),
+              );
+          });
+        }
+        return baseFetch(input, init);
+      });
+      begin([file]);
+      await settle();
+      reportModel();
+      await settle();
+      expect(releaseUpload).toBeDefined();
+
+      useChatStore.getState().stop();
+      expect(useChatStore.getState().failedSendDraft?.files[0]).toBe(file);
+      releaseUpload();
+      await settle();
+
+      expect(eventBodies()).toEqual([]);
+      expect(useChatStore.getState().failedSendDraft).toMatchObject({
+        text: original,
+        files: [file],
+      });
+      expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toEqual([]);
+    },
+  );
+
+  it("restores the draft when native startup fails without dispatching", async () => {
+    begin();
+    await settle();
+    handleSessionEvent({ type: "session_status", conversationId: sessionId, status: "failed" });
+    await settle();
+
+    expect(eventBodies()).toEqual([]);
+    expect(useChatStore.getState()).toMatchObject({
+      status: "idle",
+      pendingUserMessages: [],
+      failedSendDraft: { conversationId: sessionId, text: original, files: [] },
+    });
+    expect(useChatStore.getState().blocks.some((b) => b.type === "error")).toBe(true);
+  });
+
+  it("bounds the model wait and restores the draft instead of silently sending it", async () => {
+    vi.useFakeTimers();
+    begin();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(eventBodies()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(180_000);
+
+    expect(eventBodies()).toEqual([]);
+    expect(useChatStore.getState()).toMatchObject({
+      status: "idle",
+      pendingUserMessages: [],
+      failedSendDraft: { conversationId: sessionId, text: original, files: [] },
+    });
+    expect(useChatStore.getState().blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "error",
+          message: expect.stringContaining("model did not finish starting"),
+        }),
+      ]),
+    );
+  });
+
+  it("abandons the waiting send when its conversation is disposed", async () => {
+    begin();
+    await settle();
+    conversationRegistry.release(sessionId);
+    reportModel();
+    await settle();
+
+    expect(eventBodies()).toEqual([]);
+    expect(conversationRegistry.peek(sessionId)).toBeUndefined();
+  });
+});
+
 describe("chatStore — sendSlashCommand", () => {
   /** Parse the JSON body of the single POST /events call. */
   function lastEventBody(): { type: string; data: Record<string, unknown> } {
