@@ -106,9 +106,11 @@ assignments and every `-c` override outside the permission and model keys are
 masked, and URLs lose their userinfo and query string.
 
 The TUI's private tmux server keeps its pane after the process exits
-(`keep_alive_after_exit`), so the `terminal_exit_observed` event carries the
-inner exit status and the final screen instead of a bare "no server running"
-probe failure.
+(`keep_alive_after_exit`), so an early exit is captured instead of collapsing
+into a bare "no server running" probe failure. The `terminal_exit_observed`
+event records the inner exit status (`terminal_exit_status`); the pane's final
+screen is delivered separately on the `TerminalExitEvent` (`last_output`) and
+surfaced in the terminal failure display.
 
 ## Codex startup failure snapshot
 

@@ -509,6 +509,26 @@ async def test_remote_resume_relative_config_roots_are_absolute(
             ],
             id="config-overrides",
         ),
+        pytest.param(
+            [
+                "codex",
+                "--remote=ws://user:pw@127.0.0.1:4321/ws?sig=secret",
+                "--cd=/tmp/work",
+                "resume",
+            ],
+            [
+                "codex",
+                "--remote=ws://127.0.0.1:4321/ws",
+                "--cd=/tmp/work",
+                "resume",
+            ],
+            id="attached-url-option",
+        ),
+        pytest.param(
+            ["codex", "--remote", "ws://[broken", "-c", 'endpoint="ws://[broken'],
+            ["codex", "--remote", "***", "-c", "endpoint=***"],
+            id="malformed-url-never-raises",
+        ),
     ],
 )
 def test_redact_codex_launch_args_masks_secret_bearing_values(

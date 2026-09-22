@@ -57,6 +57,9 @@ _LOGGABLE_CONFIG_KEYS = frozenset(
 )
 _ENV_ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
 _URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+# An option with its value attached by ``=`` (e.g. ``--remote=ws://...``), so
+# the value can be redacted without treating the whole token as opaque.
+_ATTACHED_OPTION = re.compile(r"^(--?[A-Za-z0-9][A-Za-z0-9-]*)=(.*)$", re.DOTALL)
 
 
 def absolute_codex_path(value: str, base: Path) -> str:
@@ -325,7 +328,10 @@ def redact_codex_launch_args(args: Sequence[str]) -> list[str]:
     shows exactly which launch was attempted. Masked: the value of every
     ``-c``/``--config`` override outside :data:`_LOGGABLE_CONFIG_KEYS`, every
     ``NAME=value`` environment assignment (an ``env`` wrapper's config args),
-    and the userinfo and query of any URL.
+    and the userinfo and query of any URL, whether it is a bare argument or
+    attached to an option by ``=`` (e.g. ``--remote=ws://user:pw@host?sig=x``).
+    Redaction never raises: a malformed URL is masked whole rather than
+    aborting the launch it is meant to record.
 
     :param args: Resolved argv after the host's config args and Omnigent's
         remote args are merged, e.g. ``["OPENAI_API_KEY=sk-x", "codex", "-c",
@@ -349,6 +355,8 @@ def redact_codex_launch_args(args: Sequence[str]) -> list[str]:
             redacted.append(f"-c{_redact_config_override(arg[2:])}")
         elif _URL_SCHEME.match(arg):
             redacted.append(_redact_url(arg))
+        elif (attached := _ATTACHED_OPTION.match(arg)) and _URL_SCHEME.match(attached.group(2)):
+            redacted.append(f"{attached.group(1)}={_redact_url(attached.group(2))}")
         elif not arg.startswith("-") and (match := _ENV_ASSIGNMENT.match(arg)):
             redacted.append(f"{match.group(1)}=***")
         else:
@@ -365,5 +373,13 @@ def _redact_config_override(override: str) -> str:
 
 
 def _redact_url(url: str) -> str:
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        # urlsplit rejects some inputs (e.g. an unterminated IPv6 literal like
+        # ``ws://[broken``). Mask the whole value so logging never aborts the
+        # launch it records.
+        return "***"
+    if not parts.scheme:
+        return "***"
     return urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, "", ""))
