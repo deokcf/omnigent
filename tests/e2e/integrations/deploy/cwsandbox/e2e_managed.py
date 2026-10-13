@@ -125,7 +125,11 @@ def start_server_sandbox(
         log(f"      sandbox={sb.sandbox_id} endpoint={url}")
         return sb, url
     except BaseException:
-        sb.stop().result()
+        # Never let a failed stop replace the startup error being raised.
+        try:
+            sb.stop().result()
+        except Exception as exc:
+            log(f"  warning: server sandbox {sb.sandbox_id} cleanup failed: {exc}")
         raise
 
 
@@ -415,6 +419,7 @@ def main() -> int:
 
     conv_id = None
     reply = None
+    cleanup_failed = False
     try:
         if not external:
             configure_and_start_server(sb, base, wandb_key)
@@ -432,17 +437,29 @@ def main() -> int:
                     log("deleted test session and requested managed sandbox cleanup")
                 except httpx.HTTPError as exc:
                     log(f"  warning: test session cleanup failed: {exc}")
+                    cleanup_failed = True
             if sb is not None:
-                sb.stop().result()
-                log("stopped server sandbox")
+                # Report separately so a failed stop never masks the real
+                # outcome (or the failure summary below).
+                try:
+                    sb.stop().result()
+                except Exception as exc:
+                    log(f"  warning: server sandbox cleanup failed: {exc}")
+                    cleanup_failed = True
+                else:
+                    log("stopped server sandbox")
 
     print("\n" + "=" * 60)
-    if reply:
+    if reply and not cleanup_failed:
         print("E2E PASSED — agent completed a turn in the managed sandbox.")
         print(f"Prompt: {PROMPT}")
         print(f"Reply:  {reply!r}")
         return 0
-    print("E2E FAILED — see logs above.")
+    if reply:
+        print("E2E FAILED — the agent turn succeeded but cleanup failed; see warnings above.")
+        print(f"Reply:  {reply!r}")
+    else:
+        print("E2E FAILED — see logs above.")
     return 1
 
 

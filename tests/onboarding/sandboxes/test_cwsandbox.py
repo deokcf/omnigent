@@ -362,7 +362,7 @@ def test_cks_creation_failure_suggests_checking_runner_ids(
 
 
 @pytest.mark.parametrize("strategy", ["wandb", "coreweave_api_key"])
-def test_auth_strategy_used_for_create_and_attach(sdk, monkeypatch, strategy):
+def test_auth_strategy_used_for_create_attach_and_terminate(sdk, monkeypatch, strategy):
     monkeypatch.setenv(AUTH_STRATEGY_ENV_VAR, strategy)
     launcher = CWSandboxLauncher()
     launcher.prepare()
@@ -370,6 +370,12 @@ def test_auth_strategy_used_for_create_and_attach(sdk, monkeypatch, strategy):
     assert sdk.run_kwargs["auth"] == strategy
     CWSandboxLauncher().attach("sb-existing")
     assert sdk.from_id_auth == strategy
+    # Terminating an id this launcher never cached must resolve it with the
+    # same explicit strategy (not ambient credentials) and then stop it.
+    sdk.from_id_auth = None
+    CWSandboxLauncher().terminate("sb-uncached")
+    assert sdk.from_id_auth == strategy
+    assert sdk.stopped == ["sb-uncached"]
 
 
 def test_coreweave_auth_requires_its_own_key(sdk, monkeypatch):

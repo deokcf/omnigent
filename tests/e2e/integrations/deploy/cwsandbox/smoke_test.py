@@ -15,8 +15,6 @@ import os
 import sys
 import time
 
-from cwsandbox import AuthStrategy, EgressRule, NetworkOptions, Sandbox
-
 DEFAULT_IMAGE = "python:3.12-slim"
 MAX_LIFETIME_S = 600
 
@@ -32,6 +30,14 @@ def main() -> int:
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     parser.add_argument("--keep", action="store_true", help="don't terminate at the end")
     args = parser.parse_args()
+    # Imported lazily: this file matches pytest's `*_test.py` pattern, and
+    # `pytest tests/e2e/` runs in environments without the optional SDK
+    # (the compat smoke gate), so a module-level import breaks collection.
+    try:
+        from cwsandbox import AuthStrategy, EgressRule, NetworkOptions, Sandbox
+    except ImportError:
+        print("ERROR: cwsandbox SDK not installed; install omnigent[cwsandbox]", file=sys.stderr)
+        return 2
     if not os.environ.get("WANDB_API_KEY"):
         print("ERROR: set WANDB_API_KEY", file=sys.stderr)
         return 2
@@ -105,8 +111,14 @@ def main() -> int:
         failures.append(f"FATAL: {exc}")
     finally:
         if sandbox is not None and not args.keep:
-            sandbox.stop().result()
-            print(f"\n  (cleaned up {sandbox.sandbox_id})")
+            # Report a failed stop on its own line so it never masks the
+            # failure that got us here, and a cleanup-only failure still fails.
+            try:
+                sandbox.stop().result()
+            except Exception as exc:
+                failures.append(f"cleanup: stop {sandbox.sandbox_id} failed: {exc}")
+            else:
+                print(f"\n  (cleaned up {sandbox.sandbox_id})")
 
     if failures:
         print("SMOKE TEST FAILED:")
